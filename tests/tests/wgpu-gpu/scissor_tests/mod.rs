@@ -6,6 +6,7 @@ pub fn all_tests(vec: &mut Vec<GpuTestInitializer>) {
         SCISSOR_TEST_EMPTY_RECT,
         SCISSOR_TEST_EMPTY_RECT_WITH_OFFSET,
         SCISSOR_TEST_CUSTOM_RECT,
+        SCISSOR_TEST_MSAA_RESOLVE,
     ]);
 }
 
@@ -23,9 +24,10 @@ const BUFFER_SIZE: usize = (TEXTURE_WIDTH * TEXTURE_HEIGHT * 4) as usize;
 async fn scissor_test_impl(
     ctx: &TestingContext,
     scissor_rect: Rect,
+    sample_count: u32,
     expected_data: [u8; BUFFER_SIZE],
 ) {
-    let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+    let texture_descriptor = wgpu::TextureDescriptor {
         label: Some("Offscreen texture"),
         size: wgpu::Extent3d {
             width: TEXTURE_WIDTH,
@@ -38,8 +40,21 @@ async fn scissor_test_impl(
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
-    });
+    };
+    let texture = ctx.device.create_texture(&texture_descriptor);
     let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // With multisampling, the pass renders into this texture and resolves into `texture`.
+    let multisampled_view = (sample_count > 1).then(|| {
+        ctx.device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("Multisampled texture"),
+                sample_count,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                ..texture_descriptor
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default())
+    });
 
     let shader = ctx
         .device
@@ -58,7 +73,10 @@ async fn scissor_test_impl(
             },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: Some("fs_main"),
@@ -78,13 +96,32 @@ async fn scissor_test_impl(
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Renderpass"),
+        if multisampled_view.is_some() {
+            // Stale contents, so a resolve that skips texels outside the scissor rect is visible.
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Fill resolve target"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &texture_view,
                     depth_slice: None,
                     resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Renderpass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: multisampled_view.as_ref().unwrap_or(&texture_view),
+                    depth_slice: None,
+                    resolve_target: multisampled_view.as_ref().map(|_| &texture_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.0,
@@ -128,6 +165,7 @@ static SCISSOR_TEST_FULL_RECT: GpuTestConfiguration =
                 width: TEXTURE_WIDTH,
                 height: TEXTURE_HEIGHT,
             },
+            1,
             [255; BUFFER_SIZE],
         )
         .await
@@ -144,6 +182,7 @@ static SCISSOR_TEST_EMPTY_RECT: GpuTestConfiguration =
                 width: 0,
                 height: 0,
             },
+            1,
             [0; BUFFER_SIZE],
         )
         .await;
@@ -160,6 +199,7 @@ static SCISSOR_TEST_EMPTY_RECT_WITH_OFFSET: GpuTestConfiguration = GpuTestConfig
                 width: 0,
                 height: 0,
             },
+            1,
             [0; BUFFER_SIZE],
         )
         .await
@@ -180,6 +220,28 @@ static SCISSOR_TEST_CUSTOM_RECT: GpuTestConfiguration =
                 width: TEXTURE_WIDTH / 2,
                 height: TEXTURE_HEIGHT / 2,
             },
+            1,
+            expected_result,
+        )
+        .await;
+    });
+
+#[apply(gpu_test!)]
+static SCISSOR_TEST_MSAA_RESOLVE: GpuTestConfiguration =
+    GpuTestConfiguration::new().run_async(|ctx| async move {
+        let mut expected_result = [0; BUFFER_SIZE];
+        expected_result[((3 * BUFFER_SIZE) / 4)..][..BUFFER_SIZE / 4]
+            .copy_from_slice(&[255; BUFFER_SIZE / 4]);
+
+        scissor_test_impl(
+            &ctx,
+            Rect {
+                x: TEXTURE_WIDTH / 2,
+                y: TEXTURE_HEIGHT / 2,
+                width: TEXTURE_WIDTH / 2,
+                height: TEXTURE_HEIGHT / 2,
+            },
+            4,
             expected_result,
         )
         .await;
