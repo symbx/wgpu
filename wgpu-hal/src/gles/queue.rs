@@ -1129,6 +1129,8 @@ impl super::Queue {
                 ref dst,
                 ref size,
             } => {
+                // The scissor test applies to blits: without this only the last scissor rect is resolved
+                unsafe { gl.disable(glow::SCISSOR_TEST) };
                 unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.draw_fbo)) };
                 unsafe { gl.read_buffer(attachment) };
                 unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.copy_fbo)) };
